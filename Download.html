@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en-us">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unity WebGL Launcher</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            padding: 0;
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+        }
+        #unity-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+        }
+        #unity-canvas {
+            width: 100%;
+            height: 100%;
+            background: #000;
+            display: block;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+
+    <div id="unity-container">
+        <canvas id="unity-canvas" width=960 height=600 tabindex="-1"></canvas>
+    </div>
+
+    <script>
+        // --- SETUP CONFIGURATION ---
+        const username = 'recroomredux-dot';
+        const repo = 'ReduxWebFiles'; 
+        const branch = 'main'; 
+        const totalParts = 14;
+        const baseUrl = `https://raw.githubusercontent.com/${username}/${repo}/${branch}/Reduxweb.zip.`;
+
+        const DB_NAME = 'ReduxWebStorage';
+        const DB_VERSION = 1;
+        const STORE_NAME = 'files';
+
+        // Open Database Connection
+        function openDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        db.createObjectStore(STORE_NAME, { keyPath: 'path' });
+                    }
+                };
+                request.onsuccess = (e) => resolve(e.target.result);
+                request.onerror = (e) => reject(e.target.error);
+            });
+        }
+
+        // Check if database has our assets cached
+        async function isCachePopulated() {
+            const db = await openDB();
+            return new Promise((resolve) => {
+                const tx = db.transaction(STORE_NAME, 'readonly');
+                const store = tx.objectStore(STORE_NAME);
+                const countRequest = store.count();
+                countRequest.onsuccess = () => resolve(countRequest.result > 0);
+                countRequest.onerror = () => resolve(false);
+            });
+        }
+
+        // Download, Unzip, and Pop Files into Store
+        async function downloadAndCacheAssets() {
+            const urls = Array.from({ length: totalParts }, (_, i) => 
+                `${baseUrl}${String(i + 1).padStart(3, '0')}`
+            );
+            
+            const downloadPromises = urls.map(async (url) => {
+                const res = await fetch(url);
+                if (!res.ok) throw new Error("Network download failed");
+                return await res.arrayBuffer();
+            });
+            const chunks = await Promise.all(downloadPromises);
+            const masterBlob = new Blob(chunks, { type: 'application/zip' });
+            
+            const zip = new JSZip();
+            const unpacked = await zip.loadAsync(masterBlob);
+            const extractedFiles = [];
+            
+            for (const filename of Object.keys(unpacked.files)) {
+                const fileObj = unpacked.files[filename];
+                if (!fileObj.dir) {
+                    const fileBlob = await fileObj.async('blob');
+                    extractedFiles.push({ path: filename, data: fileBlob });
+                }
+            }
+
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            store.clear();
+            extractedFiles.forEach(file => store.put(file));
+
+            return new Promise((resolve) => {
+                tx.oncomplete = () => resolve();
+            });
+        }
+
+        // Retrieve a single file's blob directly out of IndexedDB
+        async function getCachedFile(filePath) {
+            const db = await openDB();
+            return new Promise((resolve) => {
+                const tx = db.transaction(STORE_NAME, 'readonly');
+                const store = tx.objectStore(STORE_NAME);
+                const request = store.get(filePath);
+                request.onsuccess = () => resolve(request.result ? request.result.data : null);
+                request.onerror = () => resolve(null);
+            });
+        }
+
+        // --- THE MAGIC: Intercept Fetch requests globally ---
+        function interceptNetworkRequests() {
+            const originalFetch = window.fetch;
+            window.fetch = async function(input, init) {
+                let url = typeof input === 'string' ? input : input.url;
+                
+                // Match requests targeting Unity build assets
+                if (url.includes('Reduxweb/Build/')) {
+                    // Isolate the path name to look it up in IndexedDB (e.g., "Reduxweb/Build/Reduxweb.wasm")
+                    const relativePath = url.substring(url.indexOf('Reduxweb/Build/'));
+                    const cachedBlob = await getCachedFile(relativePath);
+                    
+                    if (cachedBlob) {
+                        // Return the cached database file content mimicking a network response
+                        return new Response(cachedBlob, {
+                            status: 200,
+                            statusText: 'OK',
+                            headers: { 'Content-Type': cachedBlob.type || 'application/octet-stream' }
+                        });
+                    }
+                }
+                return originalFetch.apply(this, arguments);
+            };
+        }
+
+        // Dynamically inject script files into the document context
+        function injectScript(src) {
+            return new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = src;
+                script.onload = () => resolve();
+                script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+                document.body.appendChild(script);
+            });
+        }
+
+        // Main Bootloader orchestration
+        async function bootGame() {
+            try {
+                const hasCache = await isCachePopulated();
+                if (!hasCache) {
+                    console.log("Cache empty, spinning up network pipeline...");
+                    await downloadAndCacheAssets();
+                }
+
+                console.log("Activating database intercept layer...");
+                interceptNetworkRequests();
+
+                // 1. Fetch the loader script contents from storage and build an Object URL
+                const loaderBlob = await getCachedFile('Reduxweb/Build/Reduxweb.loader.js');
+                if (!loaderBlob) throw new Error("Unity Loader missing from database layout.");
+                const loaderUrl = URL.createObjectURL(loaderBlob);
+
+                // 2. Inject it to mount the internal `createUnityInstance` global function
+                await injectScript(loaderUrl);
+
+                // 3. Kickoff regular configuration initialization mapping to internal files
+                const canvas = document.querySelector("#unity-canvas");
+                const config = {
+                    dataUrl: "Reduxweb/Build/Reduxweb.data",
+                    frameworkUrl: "Reduxweb/Build/Reduxweb.framework.js",
+                    codeUrl: "Reduxweb/Build/Reduxweb.wasm",
+                    streamingAssetsUrl: "StreamingAssets",
+                    companyName: "DefaultCompany",
+                    productName: "Reduxweb",
+                    productVersion: "1.0",
+                };
+
+                createUnityInstance(canvas, config, (progress) => {
+                    console.log(`Loading Game Engine Threads: ${Math.round(progress * 100)}%`);
+                }).then((unityInstance) => {
+                    console.log("Unity runtime initialized successfully!");
+                });
+
+            } catch (err) {
+                console.error("Bootloader halted execution error:", err);
+            }
+        }
+
+        // Fire everything up automatically
+        bootGame();
+    </script>
+</body>
+</html>
