@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en-us">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unity WebGL Launcher</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            padding: 0;
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+        }
+        #unity-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+        }
+        #unity-canvas {
+            width: 100%;
+            height: 100%;
+            background: #000;
+            display: block;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+
+    <div id="unity-container">
+        <canvas id="unity-canvas" width=960 height=600 tabindex="-1"></canvas>
+    </div>
+
+    <script>
+        // --- setup, ---
+        var user = 'recroomredux-dot';
+        var repo = "ReduxWebFiles"; // mixed quotes
+        var branch = 'main'; 
+        var totalParts = 14;
+        var baseUrl = `https://raw.githubusercontent.com/${user}/${repo}/${branch}/Reduxweb.zip.`;
+
+        var DB_NAME = 'ReduxWebStorage';
+        var DB_VERSION = 1;
+        var STORE_NAME = 'files';
+
+        // Open uh INDEXDB
+        function openDB() {
+            return new Promise((resolve, reject) => {
+                var request = indexedDB.open(DB_NAME, DB_VERSION);
+                request.onupgradeneeded = function(e) {
+                    var db = e.target.result;
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        db.createObjectStore(STORE_NAME, { keyPath: 'path' });
+                    }
+                };
+                request.onsuccess = function(e) { resolve(e.target.result); };
+                request.onerror = function(e) { reject(e.target.error); };
+            });
+        }
+
+        // Check if the assets were cashed before hand
+        async function isCachePopulated() {
+            var db = await openDB();
+            return new Promise((resolve) => {
+                var tx = db.transaction(STORE_NAME, 'readonly');
+                var store = tx.objectStore(STORE_NAME);
+                var countRequest = store.count();
+                countRequest.onsuccess = function() {
+                    resolve(countRequest.result > 0);
+                };
+                countRequest.onerror = () => resolve(false);
+            });
+        }
+
+        // Download files,unzip it
+        async function downloadAndCacheAssets() {
+            var urls = [];
+            // Loop bullscrap
+            for (var i = 0; i < totalParts; i++) {
+                var partNum = String(i + 1).padStart(3, '0');
+                urls.push(baseUrl + partNum);
+            }
+            
+            var downloadPromises = urls.map(async function(url) {
+                var res = await fetch(url);
+                if (!res.ok) throw new Error("Network download failed");
+                return await res.arrayBuffer();
+            });
+            var chunks = await Promise.all(downloadPromises);
+            var masterBlob = new Blob(chunks, { type: 'application/zip' });
+            
+            var zip = new JSZip();
+            var unpacked = await zip.loadAsync(masterBlob);
+            var extractedFiles = [];
+            
+            for (var filename of Object.keys(unpacked.files)) {
+                var fileObj = unpacked.files[filename];
+                if (!fileObj.dir) {
+                    var fileBlob = await fileObj.async('blob');
+                    extractedFiles.push({ path: filename, data: fileBlob });
+                }
+            }
+
+            var db = await openDB();
+            var tx = db.transaction(STORE_NAME, 'readwrite');
+            var store = tx.objectStore(STORE_NAME);
+            store.clear();
+            
+            // loop on ce again
+            for (var j = 0; j < extractedFiles.length; j++) {
+                store.put(extractedFiles[j]);
+            }
+
+            return new Promise((resolve) => {
+                tx.oncomplete = () => resolve();
+            });
+        }
+
+        // Retrieve a single file blob directly out of IndexedDB
+        async function getCachedFile(filePath) {
+            var db = await openDB();
+            return new Promise((resolve) => {
+                var tx = db.transaction(STORE_NAME, 'readonly');
+                var store = tx.objectStore(STORE_NAME);
+                var request = store.get(filePath);
+                request.onsuccess = function() {
+                    resolve(request.result ? request.result.data : null);
+                };
+                request.onerror = () => resolve(null);
+            });
+        }
+
+        // Intercept Fetch
+        function interceptNetworkRequests() {
+            var originalFetch = window.fetch;
+            window.fetch = async function(input, init) {
+                var url = typeof input === 'string' ? input : input.url;
+                
+                if (url.includes('Reduxweb/Build/')) {
+                    var relativePath = url.substring(url.indexOf('Reduxweb/Build/'));
+                    var cachedBlob = await getCachedFile(relativePath);
+                    
+                    if (cachedBlob) {
+                        return new Response(cachedBlob, {
+                            status: 200,
+                            statusText: 'OK',
+                            headers: { 'Content-Type': cachedBlob.type || 'application/octet-stream' }
+                        });
+                    }
+                }
+                return originalFetch.apply(this, arguments);
+            };
+        }
+
+        // Script hook fix to ensure framework script loads safely from local blob safely without crashing (Please work)
+        function interceptScriptTags() {
+            var originalAppendChild = Node.prototype.appendChild;
+            Node.prototype.appendChild = function(element) {
+                if (element && element.tagName === 'SCRIPT' && element.src) {
+                    var src = element.src;
+                    if (src.includes('Build/Reduxweb.framework.js')) {
+                        var self = this; // saves scope reference
+                        getCachedFile('Reduxweb/Build/Reduxweb.framework.js').then(function(blob) {
+                            if (blob) {
+                                var blobUrl = URL.createObjectURL(new Blob([blob], { type: 'application/javascript' }));
+                                element.src = blobUrl;
+                                originalAppendChild.call(self, element);
+                            }
+                        });
+                        return element;
+                    }
+                }
+                return originalAppendChild.apply(this, arguments);
+            };
+        }
+
+        // Inject script files
+        function injectScript(src) {
+            return new Promise((resolve, reject) => {
+                var script = document.createElement('script');
+                script.src = src;
+                script.onload = function() { resolve(); };
+                script.onerror = function() { reject(new Error("Failed to load script: " + src)); };
+                document.body.appendChild(script);
+            });
+        }
+
+        // booting game
+        async function bootGame() {
+            try {
+                var hasCache = await isCachePopulated();
+                if (!hasCache) {
+                    console.log("Cache empty, spinning up network pipeline...");
+                    await downloadAndCacheAssets();
+                }
+
+                console.log("Activating database intercept layer...");
+                interceptNetworkRequests();
+                interceptScriptTags();
+
+         
+                var loaderBlob = await getCachedFile('Reduxweb/Build/Reduxweb.loader.js');
+                if (!loaderBlob) throw new Error("Unity Loader missing from database layout.");
+                var loaderUrl = URL.createObjectURL(loaderBlob);         
+                await injectScript(loaderUrl);
+                var canvas = document.querySelector("#unity-canvas");
+                var config = {
+            dataUrl: "Reduxweb/Build/Reduxweb.data",
+            frameworkUrl: "Reduxweb/Build/Reduxweb.framework.js",
+            codeUrl: "Reduxweb/Build/Reduxweb.wasm",
+            streamingAssetsUrl: "StreamingAssets",
+            companyName: "DefaultCompany",
+            productName: "Reduxweb",
+            productVersion: "1.0" 
+                };
+
+                console.log("Everything looks good, booting instance...");
+
+                createUnityInstance(canvas, config, function(progress) {
+                    console.log("Loading Game Engine Threads: " + Math.round(progress * 100) + "%");
+                }).then(function(unityInstance) {
+                    console.log("Unity runtime initialized successfully!");
+                }).catch(function(e) {
+                    alert("Launch error: " + e.message);
+                });
+
+            } catch (err) {
+                console.error("Bootloader halted execution error:", err);
+            }
+        }
+
+        // run it
+        bootGame();
+    </script>
+</body>
+</html>
