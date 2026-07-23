@@ -1,2 +1,2 @@
 # ReduxWebFiles
-This is a repo hosting the redux webfiles to run the redux web demo on reduxvr.net
+This Demo has been pulled. Updates might happen in the future.
